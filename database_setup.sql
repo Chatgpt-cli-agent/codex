@@ -1,0 +1,1 @@
+CREATE TABLE user_context (\n    user_id VARCHAR(255) NOT NULL,\n    session_id VARCHAR(255) NOT NULL,\n    timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,\n    context_data TEXT,\n    PRIMARY KEY (user_id, session_id)\n);
