@@ -1,31 +1,75 @@
 #![allow(clippy::unwrap_used)]
 
-use codex_core::CodexAuth;
-use codex_core::ConversationManager;
-use codex_core::ModelProviderInfo;
-use codex_core::built_in_model_providers;
-use codex_core::model_family::find_family_for_model;
-use codex_core::protocol::AskForApproval;
-use codex_core::protocol::EventMsg;
-use codex_core::protocol::InputItem;
-use codex_core::protocol::Op;
-use codex_core::protocol::SandboxPolicy;
-use codex_core::protocol_config_types::ReasoningEffort;
-use codex_core::protocol_config_types::ReasoningSummary;
+use codex_apply_patch::APPLY_PATCH_TOOL_INSTRUCTIONS;
 use codex_core::shell::default_user_shell;
-use core_test_support::load_default_config_for_test;
-use core_test_support::load_sse_fixture_with_id;
+use codex_features::Feature;
+use codex_protocol::config_types::CollaborationMode;
+use codex_protocol::config_types::ModeKind;
+use codex_protocol::config_types::ReasoningSummary;
+use codex_protocol::config_types::Settings;
+use codex_protocol::config_types::WebSearchMode;
+use codex_protocol::models::PermissionProfile;
+use codex_protocol::openai_models::ReasoningEffort;
+use codex_protocol::permissions::NetworkSandboxPolicy;
+use codex_protocol::protocol::AskForApproval;
+use codex_protocol::protocol::ENVIRONMENT_CONTEXT_OPEN_TAG;
+use codex_protocol::protocol::EventMsg;
+use codex_protocol::protocol::Op;
+use codex_protocol::user_input::UserInput;
+use core_test_support::TempDirExt;
+use core_test_support::responses::ev_completed;
+use core_test_support::responses::ev_response_created;
+use core_test_support::responses::mount_sse_once;
+use core_test_support::responses::sse;
+use core_test_support::responses::start_mock_server;
+use core_test_support::skip_if_no_network;
+use core_test_support::test_codex::TestCodex;
+use core_test_support::test_codex::test_codex;
+use core_test_support::test_codex::turn_permission_fields;
 use core_test_support::wait_for_event;
+use pretty_assertions::assert_eq;
 use tempfile::TempDir;
-use wiremock::Mock;
-use wiremock::MockServer;
-use wiremock::ResponseTemplate;
-use wiremock::matchers::method;
-use wiremock::matchers::path;
 
-/// Build minimal SSE stream with completed marker using the JSON fixture.
-fn sse_completed(id: &str) -> String {
-    load_sse_fixture_with_id("tests/fixtures/completed_template.json", id)
+fn text_user_input(text: String) -> serde_json::Value {
+    text_user_input_parts(vec![text])
+}
+
+fn text_user_input_parts(texts: Vec<String>) -> serde_json::Value {
+    serde_json::json!({
+        "type": "message",
+        "role": "user",
+        "content": texts
+            .into_iter()
+            .map(|text| serde_json::json!({ "type": "input_text", "text": text }))
+            .collect::<Vec<_>>()
+    })
+}
+
+fn assert_default_env_context(text: &str, cwd: &str) {
+    assert!(
+        text.starts_with(ENVIRONMENT_CONTEXT_OPEN_TAG),
+        "expected environment context fragment: {text}"
+    );
+    assert!(
+        text.contains(&format!("<cwd>{cwd}</cwd>")),
+        "expected cwd in environment context: {text}"
+    );
+    assert!(
+        text.contains(&format!("<shell>{}</shell>", default_user_shell().name())),
+        "expected shell in environment context: {text}"
+    );
+    assert!(
+        text.contains("<current_date>") && text.contains("</current_date>"),
+        "expected current_date in environment context: {text}"
+    );
+    assert!(
+        text.contains("<timezone>") && text.contains("</timezone>"),
+        "expected timezone in environment context: {text}"
+    );
+    assert!(
+        text.ends_with("</environment_context>"),
+        "expected closing environment_context tag: {text}"
+    );
 }
 
 fn assert_tool_names(body: &serde_json::Value, expected_names: &[&str]) {
@@ -34,386 +78,402 @@ fn assert_tool_names(body: &serde_json::Value, expected_names: &[&str]) {
             .as_array()
             .unwrap()
             .iter()
-            .map(|t| t["name"].as_str().unwrap().to_string())
+            .map(|t| {
+                t.get("name")
+                    .and_then(|value| value.as_str())
+                    .or_else(|| t.get("type").and_then(|value| value.as_str()))
+                    .unwrap()
+                    .to_string()
+            })
             .collect::<Vec<_>>(),
         expected_names
     );
 }
 
+fn normalize_newlines(text: &str) -> String {
+    text.replace("\r\n", "\n")
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn codex_mini_latest_tools() {
+async fn prompt_tools_are_consistent_across_requests() -> anyhow::Result<()> {
+    skip_if_no_network!(Ok(()));
     use pretty_assertions::assert_eq;
 
-    let server = MockServer::start().await;
+    let server = start_mock_server().await;
+    let req1 = mount_sse_once(
+        &server,
+        sse(vec![ev_response_created("resp-1"), ev_completed("resp-1")]),
+    )
+    .await;
+    let req2 = mount_sse_once(
+        &server,
+        sse(vec![ev_response_created("resp-2"), ev_completed("resp-2")]),
+    )
+    .await;
 
-    let sse = sse_completed("resp");
-    let template = ResponseTemplate::new(200)
-        .insert_header("content-type", "text/event-stream")
-        .set_body_raw(sse, "text/event-stream");
+    let TestCodex {
+        codex,
+        config,
+        thread_manager,
+        ..
+    } = test_codex()
+        .with_config(|config| {
+            config.user_instructions = Some("be consistent and helpful".to_string());
+            config.model = Some("gpt-5.2".to_string());
+            // Keep tool expectations stable when the default web_search mode changes.
+            config
+                .web_search_mode
+                .set(WebSearchMode::Cached)
+                .expect("test web_search_mode should satisfy constraints");
+            config
+                .features
+                .enable(Feature::CollaborationModes)
+                .expect("test config should allow feature update");
+        })
+        .build(&server)
+        .await?;
+    let base_instructions = thread_manager
+        .get_models_manager()
+        .get_model_info(
+            config
+                .model
+                .as_deref()
+                .expect("test config should have a model"),
+            &config.to_models_manager_config(),
+        )
+        .await
+        .base_instructions;
 
-    // Expect two POSTs to /v1/responses
-    Mock::given(method("POST"))
-        .and(path("/v1/responses"))
-        .respond_with(template)
-        .expect(2)
-        .mount(&server)
-        .await;
+    codex
+        .submit(Op::UserInput {
+            environments: None,
+            items: vec![UserInput::Text {
+                text: "hello 1".into(),
+                text_elements: Vec::new(),
+            }],
+            final_output_json_schema: None,
+            responsesapi_client_metadata: None,
+        })
+        .await?;
+    wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
 
-    let model_provider = ModelProviderInfo {
-        base_url: Some(format!("{}/v1", server.uri())),
-        ..built_in_model_providers()["openai"].clone()
+    codex
+        .submit(Op::UserInput {
+            environments: None,
+            items: vec![UserInput::Text {
+                text: "hello 2".into(),
+                text_elements: Vec::new(),
+            }],
+            final_output_json_schema: None,
+            responsesapi_client_metadata: None,
+        })
+        .await?;
+    wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
+
+    let mut expected_tools_names = if cfg!(windows) {
+        vec!["shell_command"]
+    } else {
+        vec!["exec_command", "write_stdin"]
+    };
+    expected_tools_names.extend([
+        "update_plan",
+        "request_user_input",
+        "apply_patch",
+        "web_search",
+        "view_image",
+        "spawn_agent",
+        "send_input",
+        "resume_agent",
+        "wait_agent",
+        "close_agent",
+    ]);
+    let body0 = req1.single_request().body_json();
+
+    let expected_instructions = if expected_tools_names.contains(&"apply_patch") {
+        base_instructions
+    } else {
+        [base_instructions, APPLY_PATCH_TOOL_INSTRUCTIONS.to_string()].join("\n")
     };
 
-    let cwd = TempDir::new().unwrap();
-    let codex_home = TempDir::new().unwrap();
-    let mut config = load_default_config_for_test(&codex_home);
-    config.cwd = cwd.path().to_path_buf();
-    config.model_provider = model_provider;
-    config.user_instructions = Some("be consistent and helpful".to_string());
-
-    let conversation_manager =
-        ConversationManager::with_auth(CodexAuth::from_api_key("Test API Key"));
-    config.include_apply_patch_tool = false;
-    config.model = "codex-mini-latest".to_string();
-    config.model_family = find_family_for_model("codex-mini-latest").unwrap();
-
-    let codex = conversation_manager
-        .new_conversation(config)
-        .await
-        .expect("create new conversation")
-        .conversation;
-
-    codex
-        .submit(Op::UserInput {
-            items: vec![InputItem::Text {
-                text: "hello 1".into(),
-            }],
-        })
-        .await
-        .unwrap();
-    wait_for_event(&codex, |ev| matches!(ev, EventMsg::TaskComplete(_))).await;
-
-    codex
-        .submit(Op::UserInput {
-            items: vec![InputItem::Text {
-                text: "hello 2".into(),
-            }],
-        })
-        .await
-        .unwrap();
-    wait_for_event(&codex, |ev| matches!(ev, EventMsg::TaskComplete(_))).await;
-
-    let requests = server.received_requests().await.unwrap();
-    assert_eq!(requests.len(), 2, "expected two POST requests");
-
-    let expected_instructions = [
-        include_str!("../../prompt.md"),
-        include_str!("../../../apply-patch/apply_patch_tool_instructions.md"),
-    ]
-    .join("\n");
-
-    let body0 = requests[0].body_json::<serde_json::Value>().unwrap();
     assert_eq!(
         body0["instructions"],
         serde_json::json!(expected_instructions),
     );
-    let body1 = requests[1].body_json::<serde_json::Value>().unwrap();
+    assert_tool_names(&body0, &expected_tools_names);
+
+    let body1 = req2.single_request().body_json();
     assert_eq!(
         body1["instructions"],
         serde_json::json!(expected_instructions),
     );
-}
+    assert_tool_names(&body1, &expected_tools_names);
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn prompt_tools_are_consistent_across_requests() {
-    use pretty_assertions::assert_eq;
-
-    let server = MockServer::start().await;
-
-    let sse = sse_completed("resp");
-    let template = ResponseTemplate::new(200)
-        .insert_header("content-type", "text/event-stream")
-        .set_body_raw(sse, "text/event-stream");
-
-    // Expect two POSTs to /v1/responses
-    Mock::given(method("POST"))
-        .and(path("/v1/responses"))
-        .respond_with(template)
-        .expect(2)
-        .mount(&server)
-        .await;
-
-    let model_provider = ModelProviderInfo {
-        base_url: Some(format!("{}/v1", server.uri())),
-        ..built_in_model_providers()["openai"].clone()
-    };
-
-    let cwd = TempDir::new().unwrap();
-    let codex_home = TempDir::new().unwrap();
-    let mut config = load_default_config_for_test(&codex_home);
-    config.cwd = cwd.path().to_path_buf();
-    config.model_provider = model_provider;
-    config.user_instructions = Some("be consistent and helpful".to_string());
-    config.include_apply_patch_tool = true;
-    config.include_plan_tool = true;
-
-    let conversation_manager =
-        ConversationManager::with_auth(CodexAuth::from_api_key("Test API Key"));
-    let codex = conversation_manager
-        .new_conversation(config)
-        .await
-        .expect("create new conversation")
-        .conversation;
-
-    codex
-        .submit(Op::UserInput {
-            items: vec![InputItem::Text {
-                text: "hello 1".into(),
-            }],
-        })
-        .await
-        .unwrap();
-    wait_for_event(&codex, |ev| matches!(ev, EventMsg::TaskComplete(_))).await;
-
-    codex
-        .submit(Op::UserInput {
-            items: vec![InputItem::Text {
-                text: "hello 2".into(),
-            }],
-        })
-        .await
-        .unwrap();
-    wait_for_event(&codex, |ev| matches!(ev, EventMsg::TaskComplete(_))).await;
-
-    let requests = server.received_requests().await.unwrap();
-    assert_eq!(requests.len(), 2, "expected two POST requests");
-
-    let expected_instructions: &str = include_str!("../../prompt.md");
-    // our internal implementation is responsible for keeping tools in sync
-    // with the OpenAI schema, so we just verify the tool presence here
-    let expected_tools_names: &[&str] = &["shell", "update_plan", "apply_patch", "view_image"];
-    let body0 = requests[0].body_json::<serde_json::Value>().unwrap();
-    assert_eq!(
-        body0["instructions"],
-        serde_json::json!(expected_instructions),
-    );
-    assert_tool_names(&body0, expected_tools_names);
-
-    let body1 = requests[1].body_json::<serde_json::Value>().unwrap();
-    assert_eq!(
-        body1["instructions"],
-        serde_json::json!(expected_instructions),
-    );
-    assert_tool_names(&body1, expected_tools_names);
+    Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn prefixes_context_and_instructions_once_and_consistently_across_requests() {
+async fn gpt_5_tools_without_apply_patch_append_apply_patch_instructions() -> anyhow::Result<()> {
+    skip_if_no_network!(Ok(()));
     use pretty_assertions::assert_eq;
 
-    let server = MockServer::start().await;
+    let server = start_mock_server().await;
+    let req1 = mount_sse_once(
+        &server,
+        sse(vec![ev_response_created("resp-1"), ev_completed("resp-1")]),
+    )
+    .await;
+    let req2 = mount_sse_once(
+        &server,
+        sse(vec![ev_response_created("resp-2"), ev_completed("resp-2")]),
+    )
+    .await;
 
-    let sse = sse_completed("resp");
-    let template = ResponseTemplate::new(200)
-        .insert_header("content-type", "text/event-stream")
-        .set_body_raw(sse, "text/event-stream");
-
-    // Expect two POSTs to /v1/responses
-    Mock::given(method("POST"))
-        .and(path("/v1/responses"))
-        .respond_with(template)
-        .expect(2)
-        .mount(&server)
-        .await;
-
-    let model_provider = ModelProviderInfo {
-        base_url: Some(format!("{}/v1", server.uri())),
-        ..built_in_model_providers()["openai"].clone()
-    };
-
-    let cwd = TempDir::new().unwrap();
-    let codex_home = TempDir::new().unwrap();
-    let mut config = load_default_config_for_test(&codex_home);
-    config.cwd = cwd.path().to_path_buf();
-    config.model_provider = model_provider;
-    config.user_instructions = Some("be consistent and helpful".to_string());
-
-    let conversation_manager =
-        ConversationManager::with_auth(CodexAuth::from_api_key("Test API Key"));
-    let codex = conversation_manager
-        .new_conversation(config)
-        .await
-        .expect("create new conversation")
-        .conversation;
+    let TestCodex { codex, .. } = test_codex()
+        .with_config(|config| {
+            config.user_instructions = Some("be consistent and helpful".to_string());
+            config
+                .features
+                .disable(Feature::ApplyPatchFreeform)
+                .expect("test config should allow feature update");
+            config
+                .features
+                .enable(Feature::CollaborationModes)
+                .expect("test config should allow feature update");
+            config.model = Some("gpt-5.2".to_string());
+        })
+        .build(&server)
+        .await?;
 
     codex
         .submit(Op::UserInput {
-            items: vec![InputItem::Text {
+            environments: None,
+            items: vec![UserInput::Text {
                 text: "hello 1".into(),
+                text_elements: Vec::new(),
             }],
+            final_output_json_schema: None,
+            responsesapi_client_metadata: None,
         })
-        .await
-        .unwrap();
-    wait_for_event(&codex, |ev| matches!(ev, EventMsg::TaskComplete(_))).await;
+        .await?;
 
+    wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
     codex
         .submit(Op::UserInput {
-            items: vec![InputItem::Text {
+            environments: None,
+            items: vec![UserInput::Text {
                 text: "hello 2".into(),
+                text_elements: Vec::new(),
             }],
+            final_output_json_schema: None,
+            responsesapi_client_metadata: None,
         })
-        .await
-        .unwrap();
-    wait_for_event(&codex, |ev| matches!(ev, EventMsg::TaskComplete(_))).await;
+        .await?;
 
-    let requests = server.received_requests().await.unwrap();
-    assert_eq!(requests.len(), 2, "expected two POST requests");
+    wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
 
-    let shell = default_user_shell().await;
-
-    let expected_env_text = format!(
-        r#"<environment_context>
-  <cwd>{}</cwd>
-  <approval_policy>on-request</approval_policy>
-  <sandbox_mode>read-only</sandbox_mode>
-  <network_access>restricted</network_access>
-{}</environment_context>"#,
-        cwd.path().to_string_lossy(),
-        match shell.name() {
-            Some(name) => format!("  <shell>{name}</shell>\n"),
-            None => String::new(),
-        }
+    let body0 = req1.single_request().body_json();
+    let instructions0 = body0["instructions"]
+        .as_str()
+        .expect("instructions should be a string");
+    assert!(
+        instructions0.contains("You are"),
+        "expected non-empty instructions"
     );
-    let expected_ui_text =
-        "<user_instructions>\n\nbe consistent and helpful\n\n</user_instructions>";
 
-    let expected_env_msg = serde_json::json!({
-        "type": "message",
-        "id": serde_json::Value::Null,
-        "role": "user",
-        "content": [ { "type": "input_text", "text": expected_env_text } ]
-    });
-    let expected_ui_msg = serde_json::json!({
-        "type": "message",
-        "id": serde_json::Value::Null,
-        "role": "user",
-        "content": [ { "type": "input_text", "text": expected_ui_text } ]
-    });
-
-    let expected_user_message_1 = serde_json::json!({
-        "type": "message",
-        "id": serde_json::Value::Null,
-        "role": "user",
-        "content": [ { "type": "input_text", "text": "hello 1" } ]
-    });
-    let body1 = requests[0].body_json::<serde_json::Value>().unwrap();
+    let body1 = req2.single_request().body_json();
+    let instructions1 = body1["instructions"]
+        .as_str()
+        .expect("instructions should be a string");
     assert_eq!(
-        body1["input"],
-        serde_json::json!([expected_ui_msg, expected_env_msg, expected_user_message_1])
+        normalize_newlines(instructions1),
+        normalize_newlines(instructions0)
     );
 
-    let expected_user_message_2 = serde_json::json!({
-        "type": "message",
-        "id": serde_json::Value::Null,
-        "role": "user",
-        "content": [ { "type": "input_text", "text": "hello 2" } ]
-    });
-    let body2 = requests[1].body_json::<serde_json::Value>().unwrap();
-    let expected_body2 = serde_json::json!(
-        [
-            body1["input"].as_array().unwrap().as_slice(),
-            [expected_user_message_2].as_slice(),
-        ]
-        .concat()
-    );
-    assert_eq!(body2["input"], expected_body2);
+    Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn overrides_turn_context_but_keeps_cached_prefix_and_key_constant() {
+async fn prefixes_context_and_instructions_once_and_consistently_across_requests()
+-> anyhow::Result<()> {
+    skip_if_no_network!(Ok(()));
     use pretty_assertions::assert_eq;
 
-    let server = MockServer::start().await;
+    let server = start_mock_server().await;
+    let req1 = mount_sse_once(
+        &server,
+        sse(vec![ev_response_created("resp-1"), ev_completed("resp-1")]),
+    )
+    .await;
+    let req2 = mount_sse_once(
+        &server,
+        sse(vec![ev_response_created("resp-2"), ev_completed("resp-2")]),
+    )
+    .await;
 
-    let sse = sse_completed("resp");
-    let template = ResponseTemplate::new(200)
-        .insert_header("content-type", "text/event-stream")
-        .set_body_raw(sse, "text/event-stream");
+    let TestCodex { codex, config, .. } = test_codex()
+        .with_config(|config| {
+            config.user_instructions = Some("be consistent and helpful".to_string());
+            config
+                .features
+                .enable(Feature::CollaborationModes)
+                .expect("test config should allow feature update");
+        })
+        .build(&server)
+        .await?;
 
-    // Expect two POSTs to /v1/responses
-    Mock::given(method("POST"))
-        .and(path("/v1/responses"))
-        .respond_with(template)
-        .expect(2)
-        .mount(&server)
-        .await;
+    codex
+        .submit(Op::UserInput {
+            environments: None,
+            items: vec![UserInput::Text {
+                text: "hello 1".into(),
+                text_elements: Vec::new(),
+            }],
+            final_output_json_schema: None,
+            responsesapi_client_metadata: None,
+        })
+        .await?;
+    wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
 
-    let model_provider = ModelProviderInfo {
-        base_url: Some(format!("{}/v1", server.uri())),
-        ..built_in_model_providers()["openai"].clone()
-    };
+    codex
+        .submit(Op::UserInput {
+            environments: None,
+            items: vec![UserInput::Text {
+                text: "hello 2".into(),
+                text_elements: Vec::new(),
+            }],
+            final_output_json_schema: None,
+            responsesapi_client_metadata: None,
+        })
+        .await?;
+    wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
 
-    let cwd = TempDir::new().unwrap();
-    let codex_home = TempDir::new().unwrap();
-    let mut config = load_default_config_for_test(&codex_home);
-    config.cwd = cwd.path().to_path_buf();
-    config.model_provider = model_provider;
-    config.user_instructions = Some("be consistent and helpful".to_string());
+    let body1 = req1.single_request().body_json();
+    let input1 = body1["input"].as_array().expect("input array");
+    assert_eq!(
+        input1.len(),
+        3,
+        "expected permissions + cached contextual user prefix + user msg"
+    );
 
-    let conversation_manager =
-        ConversationManager::with_auth(CodexAuth::from_api_key("Test API Key"));
-    let codex = conversation_manager
-        .new_conversation(config)
-        .await
-        .expect("create new conversation")
-        .conversation;
+    let ui_text = input1[1]["content"][0]["text"]
+        .as_str()
+        .expect("ui message text");
+    assert!(
+        ui_text.contains("be consistent and helpful"),
+        "expected user instructions in UI message: {ui_text}"
+    );
+
+    let cwd_str = config.cwd.to_string_lossy();
+    let env_text = input1[1]["content"][1]["text"]
+        .as_str()
+        .expect("environment context text");
+    assert_default_env_context(env_text, &cwd_str);
+    assert_eq!(
+        input1[1]["content"][1]["type"].as_str(),
+        Some("input_text"),
+        "expected environment context bundled after UI message in cached contextual message"
+    );
+    assert_eq!(input1[2], text_user_input("hello 1".to_string()));
+
+    let body2 = req2.single_request().body_json();
+    let input2 = body2["input"].as_array().expect("input array");
+    assert_eq!(
+        &input2[..input1.len()],
+        input1.as_slice(),
+        "expected cached prefix to be reused"
+    );
+    assert_eq!(input2[input1.len()], text_user_input("hello 2".to_string()));
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn overrides_turn_context_but_keeps_cached_prefix_and_key_constant() -> anyhow::Result<()> {
+    skip_if_no_network!(Ok(()));
+    use pretty_assertions::assert_eq;
+
+    let server = start_mock_server().await;
+    let req1 = mount_sse_once(
+        &server,
+        sse(vec![ev_response_created("resp-1"), ev_completed("resp-1")]),
+    )
+    .await;
+    let req2 = mount_sse_once(
+        &server,
+        sse(vec![ev_response_created("resp-2"), ev_completed("resp-2")]),
+    )
+    .await;
+
+    let TestCodex { codex, config, .. } = test_codex()
+        .with_config(|config| {
+            config.user_instructions = Some("be consistent and helpful".to_string());
+            config
+                .features
+                .enable(Feature::CollaborationModes)
+                .expect("test config should allow feature update");
+        })
+        .build(&server)
+        .await?;
 
     // First turn
     codex
         .submit(Op::UserInput {
-            items: vec![InputItem::Text {
+            environments: None,
+            items: vec![UserInput::Text {
                 text: "hello 1".into(),
+                text_elements: Vec::new(),
             }],
+            final_output_json_schema: None,
+            responsesapi_client_metadata: None,
         })
-        .await
-        .unwrap();
-    wait_for_event(&codex, |ev| matches!(ev, EventMsg::TaskComplete(_))).await;
+        .await?;
+    wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
 
     let writable = TempDir::new().unwrap();
+    let permission_profile = PermissionProfile::workspace_write_with(
+        &[writable.abs()],
+        NetworkSandboxPolicy::Enabled,
+        /*exclude_tmpdir_env_var*/ true,
+        /*exclude_slash_tmp*/ true,
+    );
+    let sandbox_policy = permission_profile
+        .to_legacy_sandbox_policy(config.cwd.as_path())
+        .expect("workspace profile should have legacy projection");
     codex
         .submit(Op::OverrideTurnContext {
             cwd: None,
             approval_policy: Some(AskForApproval::Never),
-            sandbox_policy: Some(SandboxPolicy::WorkspaceWrite {
-                writable_roots: vec![writable.path().to_path_buf()],
-                network_access: true,
-                exclude_tmpdir_env_var: true,
-                exclude_slash_tmp: true,
-            }),
-            model: Some("o3".to_string()),
-            effort: Some(ReasoningEffort::High),
+            approvals_reviewer: None,
+            sandbox_policy: Some(sandbox_policy),
+            permission_profile: Some(permission_profile),
+            windows_sandbox_level: None,
+            model: None,
+            effort: Some(Some(ReasoningEffort::High)),
             summary: Some(ReasoningSummary::Detailed),
+            service_tier: None,
+            collaboration_mode: None,
+            personality: None,
         })
-        .await
-        .unwrap();
+        .await?;
 
     // Second turn after overrides
     codex
         .submit(Op::UserInput {
-            items: vec![InputItem::Text {
+            environments: None,
+            items: vec![UserInput::Text {
                 text: "hello 2".into(),
+                text_elements: Vec::new(),
             }],
+            final_output_json_schema: None,
+            responsesapi_client_metadata: None,
         })
-        .await
-        .unwrap();
-    wait_for_event(&codex, |ev| matches!(ev, EventMsg::TaskComplete(_))).await;
+        .await?;
+    wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
 
-    // Verify we issued exactly two requests, and the cached prefix stayed identical.
-    let requests = server.received_requests().await.unwrap();
-    assert_eq!(requests.len(), 2, "expected two POST requests");
-
-    let body1 = requests[0].body_json::<serde_json::Value>().unwrap();
-    let body2 = requests[1].body_json::<serde_json::Value>().unwrap();
+    let request1 = req1.single_request();
+    let request2 = req2.single_request();
+    let body1 = request1.body_json();
+    let body2 = request2.body_json();
     // prompt_cache_key should remain constant across overrides
     assert_eq!(
         body1["prompt_cache_key"], body2["prompt_cache_key"],
@@ -424,114 +484,268 @@ async fn overrides_turn_context_but_keeps_cached_prefix_and_key_constant() {
     // as the prefix of the second request, ensuring cache hit potential.
     let expected_user_message_2 = serde_json::json!({
         "type": "message",
-        "id": serde_json::Value::Null,
         "role": "user",
         "content": [ { "type": "input_text", "text": "hello 2" } ]
     });
-    // After overriding the turn context, the environment context should be emitted again
-    // reflecting the new approval policy and sandbox settings. Omit cwd because it did
-    // not change.
-    let expected_env_text_2 = r#"<environment_context>
-  <approval_policy>never</approval_policy>
-  <sandbox_mode>workspace-write</sandbox_mode>
-  <network_access>enabled</network_access>
-</environment_context>"#;
-    let expected_env_msg_2 = serde_json::json!({
-        "type": "message",
-        "id": serde_json::Value::Null,
-        "role": "user",
-        "content": [ { "type": "input_text", "text": expected_env_text_2 } ]
-    });
-    let expected_body2 = serde_json::json!(
-        [
-            body1["input"].as_array().unwrap().as_slice(),
-            [expected_env_msg_2, expected_user_message_2].as_slice(),
-        ]
-        .concat()
+    let expected_permissions_msg = body1["input"][0].clone();
+    let body1_input = body1["input"].as_array().expect("input array");
+    // After overriding the turn context, emit one updated permissions message.
+    let expected_permissions_msg_2 = body2["input"][body1_input.len()].clone();
+    assert_ne!(
+        expected_permissions_msg_2, expected_permissions_msg,
+        "expected updated permissions message after override"
     );
-    assert_eq!(body2["input"], expected_body2);
+    let mut expected_body2 = body1_input.to_vec();
+    expected_body2.push(expected_permissions_msg_2);
+    expected_body2.push(expected_user_message_2);
+    assert_eq!(body2["input"], serde_json::Value::Array(expected_body2));
+
+    Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn per_turn_overrides_keep_cached_prefix_and_key_constant() {
-    use pretty_assertions::assert_eq;
+async fn override_before_first_turn_emits_environment_context() -> anyhow::Result<()> {
+    skip_if_no_network!(Ok(()));
 
-    let server = MockServer::start().await;
+    let server = start_mock_server().await;
+    let req = mount_sse_once(
+        &server,
+        sse(vec![ev_response_created("resp-1"), ev_completed("resp-1")]),
+    )
+    .await;
 
-    let sse = sse_completed("resp");
-    let template = ResponseTemplate::new(200)
-        .insert_header("content-type", "text/event-stream")
-        .set_body_raw(sse, "text/event-stream");
+    let TestCodex { codex, .. } = test_codex().build(&server).await?;
 
-    // Expect two POSTs to /v1/responses
-    Mock::given(method("POST"))
-        .and(path("/v1/responses"))
-        .respond_with(template)
-        .expect(2)
-        .mount(&server)
-        .await;
-
-    let model_provider = ModelProviderInfo {
-        base_url: Some(format!("{}/v1", server.uri())),
-        ..built_in_model_providers()["openai"].clone()
+    let collaboration_mode = CollaborationMode {
+        mode: ModeKind::Default,
+        settings: Settings {
+            model: "gpt-5.4".to_string(),
+            reasoning_effort: Some(ReasoningEffort::High),
+            developer_instructions: None,
+        },
     };
 
-    let cwd = TempDir::new().unwrap();
-    let codex_home = TempDir::new().unwrap();
-    let mut config = load_default_config_for_test(&codex_home);
-    config.cwd = cwd.path().to_path_buf();
-    config.model_provider = model_provider;
-    config.user_instructions = Some("be consistent and helpful".to_string());
+    codex
+        .submit(Op::OverrideTurnContext {
+            cwd: None,
+            approval_policy: Some(AskForApproval::Never),
+            approvals_reviewer: None,
+            sandbox_policy: None,
+            permission_profile: None,
+            windows_sandbox_level: None,
+            model: Some("gpt-5.4".to_string()),
+            effort: Some(Some(ReasoningEffort::Low)),
+            summary: None,
+            service_tier: None,
+            collaboration_mode: Some(collaboration_mode),
+            personality: None,
+        })
+        .await?;
 
-    let conversation_manager =
-        ConversationManager::with_auth(CodexAuth::from_api_key("Test API Key"));
-    let codex = conversation_manager
-        .new_conversation(config)
-        .await
-        .expect("create new conversation")
-        .conversation;
+    codex
+        .submit(Op::UserInput {
+            environments: None,
+            items: vec![UserInput::Text {
+                text: "first message".into(),
+                text_elements: Vec::new(),
+            }],
+            final_output_json_schema: None,
+            responsesapi_client_metadata: None,
+        })
+        .await?;
+
+    wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
+
+    let body = req.single_request().body_json();
+    assert_eq!(body["model"].as_str(), Some("gpt-5.4"));
+    assert_eq!(
+        body.get("reasoning")
+            .and_then(|reasoning| reasoning.get("effort"))
+            .and_then(|value| value.as_str()),
+        Some("high")
+    );
+    let input = body["input"]
+        .as_array()
+        .expect("input array must be present");
+    assert!(
+        !input.is_empty(),
+        "expected at least environment context and user message"
+    );
+
+    let env_texts: Vec<&str> = input
+        .iter()
+        .filter_map(|msg| {
+            msg["content"].as_array().map(|content| {
+                content
+                    .iter()
+                    .filter_map(|item| item["text"].as_str())
+                    .collect::<Vec<_>>()
+            })
+        })
+        .flatten()
+        .filter(|text| text.starts_with(ENVIRONMENT_CONTEXT_OPEN_TAG))
+        .collect();
+    assert!(
+        !env_texts.is_empty(),
+        "expected environment context to be emitted: {env_texts:?}"
+    );
+    assert!(
+        env_texts
+            .iter()
+            .any(|text| text.contains("<current_date>") && text.contains("</current_date>")),
+        "expected current_date in environment context: {env_texts:?}"
+    );
+    assert!(
+        env_texts
+            .iter()
+            .any(|text| text.contains("<timezone>") && text.contains("</timezone>")),
+        "expected timezone in environment context: {env_texts:?}"
+    );
+
+    let env_count = input
+        .iter()
+        .filter(|msg| {
+            msg["content"]
+                .as_array()
+                .and_then(|content| {
+                    content.iter().find(|item| {
+                        item["type"].as_str() == Some("input_text")
+                            && item["text"]
+                                .as_str()
+                                .map(|text| text.starts_with(ENVIRONMENT_CONTEXT_OPEN_TAG))
+                                .unwrap_or(false)
+                    })
+                })
+                .is_some()
+        })
+        .count();
+    assert!(
+        env_count >= 1,
+        "environment context should appear at least once, found {env_count}"
+    );
+
+    let permissions_texts: Vec<&str> = input
+        .iter()
+        .filter_map(|msg| {
+            let role = msg["role"].as_str()?;
+            if role != "developer" {
+                return None;
+            }
+            msg["content"]
+                .as_array()
+                .and_then(|content| content.first())
+                .and_then(|item| item["text"].as_str())
+        })
+        .collect();
+    assert!(
+        permissions_texts.iter().any(|text| {
+            let lower = text.to_ascii_lowercase();
+            (lower.contains("approval policy") || lower.contains("approval_policy"))
+                && lower.contains("never")
+        }),
+        "permissions message should reflect overridden approval policy: {permissions_texts:?}"
+    );
+
+    let user_texts: Vec<&str> = input
+        .iter()
+        .filter_map(|msg| {
+            msg["content"].as_array().map(|content| {
+                content
+                    .iter()
+                    .filter_map(|item| item["text"].as_str())
+                    .collect::<Vec<_>>()
+            })
+        })
+        .flatten()
+        .collect();
+    assert!(
+        user_texts.contains(&"first message"),
+        "expected user message text, got {user_texts:?}"
+    );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn per_turn_overrides_keep_cached_prefix_and_key_constant() -> anyhow::Result<()> {
+    skip_if_no_network!(Ok(()));
+    use pretty_assertions::assert_eq;
+
+    let server = start_mock_server().await;
+    let req1 = mount_sse_once(
+        &server,
+        sse(vec![ev_response_created("resp-1"), ev_completed("resp-1")]),
+    )
+    .await;
+    let req2 = mount_sse_once(
+        &server,
+        sse(vec![ev_response_created("resp-2"), ev_completed("resp-2")]),
+    )
+    .await;
+
+    let TestCodex { codex, .. } = test_codex()
+        .with_config(|config| {
+            config.user_instructions = Some("be consistent and helpful".to_string());
+            config
+                .features
+                .enable(Feature::CollaborationModes)
+                .expect("test config should allow feature update");
+        })
+        .build(&server)
+        .await?;
 
     // First turn
     codex
         .submit(Op::UserInput {
-            items: vec![InputItem::Text {
+            environments: None,
+            items: vec![UserInput::Text {
                 text: "hello 1".into(),
+                text_elements: Vec::new(),
             }],
+            final_output_json_schema: None,
+            responsesapi_client_metadata: None,
         })
-        .await
-        .unwrap();
-    wait_for_event(&codex, |ev| matches!(ev, EventMsg::TaskComplete(_))).await;
+        .await?;
+    wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
 
     // Second turn using per-turn overrides via UserTurn
     let new_cwd = TempDir::new().unwrap();
     let writable = TempDir::new().unwrap();
+    let permission_profile = PermissionProfile::workspace_write_with(
+        &[writable.abs()],
+        NetworkSandboxPolicy::Enabled,
+        /*exclude_tmpdir_env_var*/ true,
+        /*exclude_slash_tmp*/ true,
+    );
+    let (sandbox_policy, permission_profile) =
+        turn_permission_fields(permission_profile, new_cwd.path());
     codex
         .submit(Op::UserTurn {
-            items: vec![InputItem::Text {
+            environments: None,
+            items: vec![UserInput::Text {
                 text: "hello 2".into(),
+                text_elements: Vec::new(),
             }],
             cwd: new_cwd.path().to_path_buf(),
             approval_policy: AskForApproval::Never,
-            sandbox_policy: SandboxPolicy::WorkspaceWrite {
-                writable_roots: vec![writable.path().to_path_buf()],
-                network_access: true,
-                exclude_tmpdir_env_var: true,
-                exclude_slash_tmp: true,
-            },
+            approvals_reviewer: None,
+            sandbox_policy,
+            permission_profile,
             model: "o3".to_string(),
-            effort: ReasoningEffort::High,
-            summary: ReasoningSummary::Detailed,
+            effort: Some(ReasoningEffort::High),
+            summary: Some(ReasoningSummary::Detailed),
+            service_tier: None,
+            collaboration_mode: None,
+            final_output_json_schema: None,
+            personality: None,
         })
-        .await
-        .unwrap();
-    wait_for_event(&codex, |ev| matches!(ev, EventMsg::TaskComplete(_))).await;
+        .await?;
+    wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
 
-    // Verify we issued exactly two requests, and the cached prefix stayed identical.
-    let requests = server.received_requests().await.unwrap();
-    assert_eq!(requests.len(), 2, "expected two POST requests");
-
-    let body1 = requests[0].body_json::<serde_json::Value>().unwrap();
-    let body2 = requests[1].body_json::<serde_json::Value>().unwrap();
+    let request1 = req1.single_request();
+    let request2 = req2.single_request();
+    let body1 = request1.body_json();
+    let body2 = request2.body_json();
 
     // prompt_cache_key should remain constant across per-turn overrides
     assert_eq!(
@@ -543,16 +757,312 @@ async fn per_turn_overrides_keep_cached_prefix_and_key_constant() {
     // as the prefix of the second request.
     let expected_user_message_2 = serde_json::json!({
         "type": "message",
-        "id": serde_json::Value::Null,
         "role": "user",
         "content": [ { "type": "input_text", "text": "hello 2" } ]
     });
-    let expected_body2 = serde_json::json!(
-        [
-            body1["input"].as_array().unwrap().as_slice(),
-            [expected_user_message_2].as_slice(),
-        ]
-        .concat()
+    let expected_permissions_msg = body1["input"][0].clone();
+    let body1_input = body1["input"].as_array().expect("input array");
+    let expected_settings_update_msg = body2["input"][body1_input.len()].clone();
+    assert_ne!(
+        expected_settings_update_msg, expected_permissions_msg,
+        "expected updated permissions message after per-turn override"
     );
-    assert_eq!(body2["input"], expected_body2);
+    assert_eq!(
+        expected_settings_update_msg["role"].as_str(),
+        Some("developer")
+    );
+    assert!(
+        request2.has_message_with_input_texts("developer", |texts| {
+            texts.iter().any(|text| text.contains("<model_switch>"))
+        }),
+        "expected model switch section after model override: {expected_settings_update_msg:?}"
+    );
+    let expected_env_msg_2 = body2["input"][body1_input.len() + 1].clone();
+    assert_eq!(expected_env_msg_2["role"].as_str(), Some("user"));
+    let env_text = expected_env_msg_2["content"][0]["text"]
+        .as_str()
+        .expect("environment context text");
+    let expected_cwd = new_cwd.path().display().to_string();
+    assert_default_env_context(env_text, &expected_cwd);
+    let mut expected_body2 = body1_input.to_vec();
+    expected_body2.push(expected_settings_update_msg);
+    expected_body2.push(expected_env_msg_2);
+    expected_body2.push(expected_user_message_2);
+    assert_eq!(body2["input"], serde_json::Value::Array(expected_body2));
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn send_user_turn_with_no_changes_does_not_send_environment_context() -> anyhow::Result<()> {
+    skip_if_no_network!(Ok(()));
+    use pretty_assertions::assert_eq;
+
+    let server = start_mock_server().await;
+    let req1 = mount_sse_once(
+        &server,
+        sse(vec![ev_response_created("resp-1"), ev_completed("resp-1")]),
+    )
+    .await;
+    let req2 = mount_sse_once(
+        &server,
+        sse(vec![ev_response_created("resp-2"), ev_completed("resp-2")]),
+    )
+    .await;
+
+    let TestCodex {
+        codex,
+        config,
+        session_configured,
+        ..
+    } = test_codex()
+        .with_config(|config| {
+            config.user_instructions = Some("be consistent and helpful".to_string());
+            config
+                .features
+                .enable(Feature::CollaborationModes)
+                .expect("test config should allow feature update");
+        })
+        .build(&server)
+        .await?;
+
+    let default_cwd = config.cwd.clone();
+    let default_approval_policy = config.permissions.approval_policy.value();
+    let default_sandbox_policy = &config.legacy_sandbox_policy();
+    let default_model = session_configured.model;
+    let default_effort = config.model_reasoning_effort;
+    let default_summary = config.model_reasoning_summary;
+
+    codex
+        .submit(Op::UserTurn {
+            environments: None,
+            items: vec![UserInput::Text {
+                text: "hello 1".into(),
+                text_elements: Vec::new(),
+            }],
+            cwd: default_cwd.to_path_buf(),
+            approval_policy: default_approval_policy,
+            approvals_reviewer: None,
+            sandbox_policy: default_sandbox_policy.clone(),
+            permission_profile: None,
+            model: default_model.clone(),
+            effort: default_effort,
+            summary: Some(default_summary.unwrap_or(ReasoningSummary::Auto)),
+            service_tier: None,
+            collaboration_mode: None,
+            final_output_json_schema: None,
+            personality: None,
+        })
+        .await?;
+    wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
+
+    codex
+        .submit(Op::UserTurn {
+            environments: None,
+            items: vec![UserInput::Text {
+                text: "hello 2".into(),
+                text_elements: Vec::new(),
+            }],
+            cwd: default_cwd.to_path_buf(),
+            approval_policy: default_approval_policy,
+            approvals_reviewer: None,
+            sandbox_policy: default_sandbox_policy.clone(),
+            permission_profile: None,
+            model: default_model.clone(),
+            effort: default_effort,
+            summary: Some(default_summary.unwrap_or(ReasoningSummary::Auto)),
+            service_tier: None,
+            collaboration_mode: None,
+            final_output_json_schema: None,
+            personality: None,
+        })
+        .await?;
+    wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
+
+    let request1 = req1.single_request();
+    let request2 = req2.single_request();
+    let body1 = request1.body_json();
+    let body2 = request2.body_json();
+
+    let expected_permissions_msg = body1["input"][0].clone();
+    let expected_ui_msg = body1["input"][1].clone();
+
+    let default_cwd_lossy = default_cwd.to_string_lossy();
+    let expected_env_text_1 = expected_ui_msg["content"][1]["text"]
+        .as_str()
+        .expect("cached environment context text")
+        .to_string();
+    assert_default_env_context(&expected_env_text_1, &default_cwd_lossy);
+
+    let expected_contextual_user_msg_1 = text_user_input_parts(vec![
+        expected_ui_msg["content"][0]["text"]
+            .as_str()
+            .expect("cached user instructions text")
+            .to_string(),
+        expected_env_text_1,
+    ]);
+    let expected_user_message_1 = text_user_input("hello 1".to_string());
+
+    let expected_input_1 = serde_json::Value::Array(vec![
+        expected_permissions_msg.clone(),
+        expected_contextual_user_msg_1.clone(),
+        expected_user_message_1.clone(),
+    ]);
+    assert_eq!(body1["input"], expected_input_1);
+
+    let expected_user_message_2 = text_user_input("hello 2".to_string());
+    let expected_input_2 = serde_json::Value::Array(vec![
+        expected_permissions_msg,
+        expected_contextual_user_msg_1,
+        expected_user_message_1,
+        expected_user_message_2,
+    ]);
+    assert_eq!(body2["input"], expected_input_2);
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn send_user_turn_with_changes_sends_environment_context() -> anyhow::Result<()> {
+    skip_if_no_network!(Ok(()));
+    use pretty_assertions::assert_eq;
+
+    let server = start_mock_server().await;
+
+    let req1 = mount_sse_once(
+        &server,
+        sse(vec![ev_response_created("resp-1"), ev_completed("resp-1")]),
+    )
+    .await;
+    let req2 = mount_sse_once(
+        &server,
+        sse(vec![ev_response_created("resp-2"), ev_completed("resp-2")]),
+    )
+    .await;
+    let TestCodex {
+        codex,
+        config,
+        session_configured,
+        ..
+    } = test_codex()
+        .with_config(|config| {
+            config.user_instructions = Some("be consistent and helpful".to_string());
+            config
+                .features
+                .enable(Feature::CollaborationModes)
+                .expect("test config should allow feature update");
+        })
+        .build(&server)
+        .await?;
+
+    let default_cwd = config.cwd.clone();
+    let default_approval_policy = config.permissions.approval_policy.value();
+    let default_sandbox_policy = &config.legacy_sandbox_policy();
+    let default_model = session_configured.model;
+    let default_effort = config.model_reasoning_effort;
+    let default_summary = config.model_reasoning_summary;
+
+    codex
+        .submit(Op::UserTurn {
+            environments: None,
+            items: vec![UserInput::Text {
+                text: "hello 1".into(),
+                text_elements: Vec::new(),
+            }],
+            cwd: default_cwd.to_path_buf(),
+            approval_policy: default_approval_policy,
+            approvals_reviewer: None,
+            sandbox_policy: default_sandbox_policy.clone(),
+            permission_profile: None,
+            model: default_model,
+            effort: default_effort,
+            summary: Some(default_summary.unwrap_or(ReasoningSummary::Auto)),
+            service_tier: None,
+            collaboration_mode: None,
+            final_output_json_schema: None,
+            personality: None,
+        })
+        .await?;
+    wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
+
+    let (sandbox_policy, permission_profile) =
+        turn_permission_fields(PermissionProfile::Disabled, default_cwd.as_path());
+    codex
+        .submit(Op::UserTurn {
+            environments: None,
+            items: vec![UserInput::Text {
+                text: "hello 2".into(),
+                text_elements: Vec::new(),
+            }],
+            cwd: default_cwd.to_path_buf(),
+            approval_policy: AskForApproval::Never,
+            approvals_reviewer: None,
+            sandbox_policy,
+            permission_profile,
+            model: "o3".to_string(),
+            effort: Some(ReasoningEffort::High),
+            summary: Some(ReasoningSummary::Detailed),
+            service_tier: None,
+            collaboration_mode: None,
+            final_output_json_schema: None,
+            personality: None,
+        })
+        .await?;
+    wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
+
+    let request1 = req1.single_request();
+    let request2 = req2.single_request();
+    let body1 = request1.body_json();
+    let body2 = request2.body_json();
+
+    let expected_permissions_msg = body1["input"][0].clone();
+    let expected_ui_msg = body1["input"][1].clone();
+
+    let expected_env_text_1 = expected_ui_msg["content"][1]["text"]
+        .as_str()
+        .expect("cached environment context text")
+        .to_string();
+    assert_default_env_context(&expected_env_text_1, &default_cwd.to_string_lossy());
+    let expected_contextual_user_msg_1 = text_user_input_parts(vec![
+        expected_ui_msg["content"][0]["text"]
+            .as_str()
+            .expect("cached user instructions text")
+            .to_string(),
+        expected_env_text_1,
+    ]);
+    let expected_user_message_1 = text_user_input("hello 1".to_string());
+    let expected_input_1 = serde_json::Value::Array(vec![
+        expected_permissions_msg.clone(),
+        expected_contextual_user_msg_1.clone(),
+        expected_user_message_1.clone(),
+    ]);
+    assert_eq!(body1["input"], expected_input_1);
+
+    let body1_input = body1["input"].as_array().expect("input array");
+    let expected_settings_update_msg = body2["input"][body1_input.len()].clone();
+    assert_ne!(
+        expected_settings_update_msg, expected_permissions_msg,
+        "expected updated permissions message after policy change"
+    );
+    assert_eq!(
+        expected_settings_update_msg["role"].as_str(),
+        Some("developer")
+    );
+    assert!(
+        request2.has_message_with_input_texts("developer", |texts| {
+            texts.iter().any(|text| text.contains("<model_switch>"))
+        }),
+        "expected model switch section after model override: {expected_settings_update_msg:?}"
+    );
+    let expected_user_message_2 = text_user_input("hello 2".to_string());
+    let expected_input_2 = serde_json::Value::Array(vec![
+        expected_permissions_msg,
+        expected_contextual_user_msg_1,
+        expected_user_message_1,
+        expected_settings_update_msg,
+        expected_user_message_2,
+    ]);
+    assert_eq!(body2["input"], expected_input_2);
+
+    Ok(())
 }

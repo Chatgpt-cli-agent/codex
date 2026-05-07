@@ -1,7 +1,8 @@
 [package]
-edition = "2024"
 name = "codex-apply-patch"
-version = { workspace = true }
+version.workspace = true
+edition.workspace = true
+license.workspace = true
 
 [lib]
 name = "codex_apply_patch"
@@ -15,13 +16,18 @@ path = "src/main.rs"
 workspace = true
 
 [dependencies]
-anyhow = "1"
-similar = "2.7.0"
-thiserror = "2.0.12"
-tree-sitter = "0.25.8"
-tree-sitter-bash = "0.25.0"
+anyhow = { workspace = true }
+codex-exec-server = { workspace = true }
+codex-utils-absolute-path = { workspace = true }
+similar = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt"] }
+tree-sitter = { workspace = true }
+tree-sitter-bash = { workspace = true }
 
 [dev-dependencies]
-assert_cmd = "2"
-pretty_assertions = "1.4.1"
-tempfile = "3.13.0"
+assert_cmd = { workspace = true }
+assert_matches = { workspace = true }
+codex-utils-cargo-bin = { workspace = true }
+pretty_assertions = { workspace = true }
+tempfile = { workspace = true }

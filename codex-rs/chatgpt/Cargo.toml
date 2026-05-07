@@ -1,21 +1,29 @@
 [package]
-edition = "2024"
 name = "codex-chatgpt"
-version = { workspace = true }
+version.workspace = true
+edition.workspace = true
+license.workspace = true
 
 [lints]
 workspace = true
 
 [dependencies]
-anyhow = "1"
-clap = { version = "4", features = ["derive"] }
-codex-common = { path = "../common", features = ["cli"] }
-codex-core = { path = "../core" }
-codex-protocol = { path = "../protocol" }
-reqwest = { version = "0.12", features = ["json", "stream"] }
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-tokio = { version = "1", features = ["full"] }
+anyhow = { workspace = true }
+clap = { workspace = true, features = ["derive"] }
+codex-app-server-protocol = { workspace = true }
+codex-connectors = { workspace = true }
+codex-core = { workspace = true }
+codex-core-plugins = { workspace = true }
+codex-git-utils = { workspace = true }
+codex-login = { workspace = true }
+codex-model-provider = { workspace = true }
+codex-plugin = { workspace = true }
+codex-utils-cli = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+tokio = { workspace = true, features = ["full"] }
 
 [dev-dependencies]
-tempfile = "3"
+codex-utils-cargo-bin = { workspace = true }
+pretty_assertions = { workspace = true }
+serde_json = { workspace = true }
+tempfile = { workspace = true }

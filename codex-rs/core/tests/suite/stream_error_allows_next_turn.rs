@@ -1,17 +1,15 @@
-use std::time::Duration;
-
-use codex_core::CodexAuth;
-use codex_core::ConversationManager;
-use codex_core::ModelProviderInfo;
-use codex_core::WireApi;
-use codex_core::protocol::EventMsg;
-use codex_core::protocol::InputItem;
-use codex_core::protocol::Op;
-use codex_core::spawn::CODEX_SANDBOX_NETWORK_DISABLED_ENV_VAR;
-use core_test_support::load_default_config_for_test;
-use core_test_support::load_sse_fixture_with_id;
-use core_test_support::wait_for_event_with_timeout;
-use tempfile::TempDir;
+use codex_model_provider_info::ModelProviderInfo;
+use codex_model_provider_info::WireApi;
+use codex_protocol::protocol::EventMsg;
+use codex_protocol::protocol::Op;
+use codex_protocol::user_input::UserInput;
+use core_test_support::responses::ev_completed;
+use core_test_support::responses::ev_response_created;
+use core_test_support::responses::sse;
+use core_test_support::skip_if_no_network;
+use core_test_support::test_codex::TestCodex;
+use core_test_support::test_codex::test_codex;
+use core_test_support::wait_for_event;
 use wiremock::Mock;
 use wiremock::MockServer;
 use wiremock::ResponseTemplate;
@@ -19,18 +17,9 @@ use wiremock::matchers::body_string_contains;
 use wiremock::matchers::method;
 use wiremock::matchers::path;
 
-fn sse_completed(id: &str) -> String {
-    load_sse_fixture_with_id("tests/fixtures/completed_template.json", id)
-}
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn continue_after_stream_error() {
-    if std::env::var(CODEX_SANDBOX_NETWORK_DISABLED_ENV_VAR).is_ok() {
-        println!(
-            "Skipping test because it cannot execute when network is disabled in a Codex sandbox."
-        );
-        return;
-    }
+    skip_if_no_network!();
 
     let server = MockServer::start().await;
 
@@ -55,7 +44,13 @@ async fn continue_after_stream_error() {
 
     let ok = ResponseTemplate::new(200)
         .insert_header("content-type", "text/event-stream")
-        .set_body_raw(sse_completed("resp_ok2"), "text/event-stream");
+        .set_body_raw(
+            sse(vec![
+                ev_response_created("resp_ok2"),
+                ev_completed("resp_ok2"),
+            ]),
+            "text/event-stream",
+        );
 
     Mock::given(method("POST"))
         .and(path("/v1/responses"))
@@ -73,6 +68,9 @@ async fn continue_after_stream_error() {
         base_url: Some(format!("{}/v1", server.uri())),
         env_key: Some("PATH".into()),
         env_key_instructions: None,
+        experimental_bearer_token: None,
+        auth: None,
+        aws: None,
         wire_api: WireApi::Responses,
         query_params: None,
         http_headers: None,
@@ -80,62 +78,53 @@ async fn continue_after_stream_error() {
         request_max_retries: Some(1),
         stream_max_retries: Some(1),
         stream_idle_timeout_ms: Some(2_000),
+        websocket_connect_timeout_ms: None,
         requires_openai_auth: false,
+        supports_websockets: false,
     };
 
-    let home = TempDir::new().unwrap();
-    let mut config = load_default_config_for_test(&home);
-    config.base_instructions = Some("You are a helpful assistant".to_string());
-    config.model_provider = provider;
-
-    let conversation_manager =
-        ConversationManager::with_auth(CodexAuth::from_api_key("Test API Key"));
-    let codex = conversation_manager
-        .new_conversation(config)
+    let TestCodex { codex, .. } = test_codex()
+        .with_config(move |config| {
+            config.base_instructions = Some("You are a helpful assistant".to_string());
+            config.model_provider = provider;
+        })
+        .build(&server)
         .await
-        .unwrap()
-        .conversation;
+        .unwrap();
 
     codex
         .submit(Op::UserInput {
-            items: vec![InputItem::Text {
+            environments: None,
+            items: vec![UserInput::Text {
                 text: "first message".into(),
+                text_elements: Vec::new(),
             }],
+            final_output_json_schema: None,
+            responsesapi_client_metadata: None,
         })
         .await
         .unwrap();
 
-    // Expect an Error followed by TaskComplete so the session is released.
-    wait_for_event_with_timeout(
-        &codex,
-        |ev| matches!(ev, EventMsg::Error(_)),
-        Duration::from_secs(5),
-    )
-    .await;
+    // Expect an Error followed by TurnComplete so the session is released.
+    wait_for_event(&codex, |ev| matches!(ev, EventMsg::Error(_))).await;
 
-    wait_for_event_with_timeout(
-        &codex,
-        |ev| matches!(ev, EventMsg::TaskComplete(_)),
-        Duration::from_secs(5),
-    )
-    .await;
+    wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
 
     // 2) Second turn: now send another prompt that should succeed using the
     // mock server SSE stream. If the agent failed to clear the running task on
     // error above, this submission would be rejected/queued indefinitely.
     codex
         .submit(Op::UserInput {
-            items: vec![InputItem::Text {
+            environments: None,
+            items: vec![UserInput::Text {
                 text: "follow up".into(),
+                text_elements: Vec::new(),
             }],
+            final_output_json_schema: None,
+            responsesapi_client_metadata: None,
         })
         .await
         .unwrap();
 
-    wait_for_event_with_timeout(
-        &codex,
-        |ev| matches!(ev, EventMsg::TaskComplete(_)),
-        Duration::from_secs(5),
-    )
-    .await;
+    wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
 }

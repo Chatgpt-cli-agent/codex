@@ -2,27 +2,27 @@ use std::fs::File;
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::PathBuf;
+use std::sync::LazyLock;
 use std::sync::Mutex;
+use std::sync::OnceLock;
 
-use codex_core::config::Config;
-use codex_core::protocol::Op;
-use once_cell::sync::Lazy;
-use once_cell::sync::OnceCell;
+use crate::app_command::AppCommand;
+use crate::legacy_core::config::Config;
 use serde::Serialize;
 use serde_json::json;
 
 use crate::app_event::AppEvent;
 
-static LOGGER: Lazy<SessionLogger> = Lazy::new(SessionLogger::new);
+static LOGGER: LazyLock<SessionLogger> = LazyLock::new(SessionLogger::new);
 
 struct SessionLogger {
-    file: OnceCell<Mutex<File>>,
+    file: OnceLock<Mutex<File>>,
 }
 
 impl SessionLogger {
     fn new() -> Self {
         Self {
-            file: OnceCell::new(),
+            file: OnceLock::new(),
         }
     }
 
@@ -37,11 +37,7 @@ impl SessionLogger {
         }
 
         let file = opts.open(path)?;
-        // If already initialized, ignore and succeed.
-        if self.file.get().is_some() {
-            return Ok(());
-        }
-        let _ = self.file.set(Mutex::new(file));
+        self.file.get_or_init(|| Mutex::new(file));
         Ok(())
     }
 
@@ -92,7 +88,7 @@ pub(crate) fn maybe_init(config: &Config) {
     let path = if let Ok(path) = std::env::var("CODEX_TUI_SESSION_LOG_PATH") {
         PathBuf::from(path)
     } else {
-        let mut p = match codex_core::config::log_dir(config) {
+        let mut p = match crate::legacy_core::config::log_dir(config) {
             Ok(dir) => dir,
             Err(_) => std::env::temp_dir(),
         };
@@ -129,9 +125,6 @@ pub(crate) fn log_inbound_app_event(event: &AppEvent) {
     }
 
     match event {
-        AppEvent::CodexEvent(ev) => {
-            write_record("to_tui", "codex_event", ev);
-        }
         AppEvent::NewSession => {
             let value = json!({
                 "ts": now_ts(),
@@ -140,12 +133,20 @@ pub(crate) fn log_inbound_app_event(event: &AppEvent) {
             });
             LOGGER.write_json_line(value);
         }
+        AppEvent::ClearUi => {
+            let value = json!({
+                "ts": now_ts(),
+                "dir": "to_tui",
+                "kind": "clear_ui",
+            });
+            LOGGER.write_json_line(value);
+        }
         AppEvent::InsertHistoryCell(cell) => {
             let value = json!({
                 "ts": now_ts(),
                 "dir": "to_tui",
                 "kind": "insert_history_cell",
-                "lines": cell.transcript_lines().len(),
+                "lines": cell.transcript_lines(u16::MAX).len(),
             });
             LOGGER.write_json_line(value);
         }
@@ -181,7 +182,7 @@ pub(crate) fn log_inbound_app_event(event: &AppEvent) {
     }
 }
 
-pub(crate) fn log_outbound_op(op: &Op) {
+pub(crate) fn log_outbound_op(op: &AppCommand) {
     if !LOGGER.is_enabled() {
         return;
     }

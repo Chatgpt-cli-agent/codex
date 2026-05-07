@@ -1,432 +1,409 @@
+use crate::shell_detect::detect_shell_type;
+use crate::shell_snapshot::ShellSnapshot;
 use serde::Deserialize;
 use serde::Serialize;
-use shlex;
 use std::path::PathBuf;
+use std::sync::Arc;
+use tokio::sync::watch;
 
 #[derive(Debug, PartialEq, Eq, Clone, Serialize, Deserialize)]
-pub struct ZshShell {
-    shell_path: String,
-    zshrc_path: String,
+pub enum ShellType {
+    Zsh,
+    Bash,
+    PowerShell,
+    Sh,
+    Cmd,
 }
 
-#[derive(Debug, PartialEq, Eq, Clone, Serialize, Deserialize)]
-pub struct PowerShellConfig {
-    exe: String, // Executable name or path, e.g. "pwsh" or "powershell.exe".
-    bash_exe_fallback: Option<PathBuf>, // In case the model generates a bash command.
-}
-
-#[derive(Debug, PartialEq, Eq, Clone, Serialize, Deserialize)]
-pub enum Shell {
-    Zsh(ZshShell),
-    PowerShell(PowerShellConfig),
-    Unknown,
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Shell {
+    pub(crate) shell_type: ShellType,
+    pub(crate) shell_path: PathBuf,
+    #[serde(
+        skip_serializing,
+        skip_deserializing,
+        default = "empty_shell_snapshot_receiver"
+    )]
+    pub(crate) shell_snapshot: watch::Receiver<Option<Arc<ShellSnapshot>>>,
 }
 
 impl Shell {
-    pub fn format_default_shell_invocation(&self, command: Vec<String>) -> Option<Vec<String>> {
-        match self {
-            Shell::Zsh(zsh) => {
-                if !std::path::Path::new(&zsh.zshrc_path).exists() {
-                    return None;
-                }
-
-                let mut result = vec![zsh.shell_path.clone()];
-                result.push("-lc".to_string());
-
-                let joined = strip_bash_lc(&command)
-                    .or_else(|| shlex::try_join(command.iter().map(|s| s.as_str())).ok());
-
-                if let Some(joined) = joined {
-                    result.push(format!("source {} && ({joined})", zsh.zshrc_path));
-                } else {
-                    return None;
-                }
-                Some(result)
-            }
-            Shell::PowerShell(ps) => {
-                // If model generated a bash command, prefer a detected bash fallback
-                if let Some(script) = strip_bash_lc(&command) {
-                    return match &ps.bash_exe_fallback {
-                        Some(bash) => Some(vec![
-                            bash.to_string_lossy().to_string(),
-                            "-lc".to_string(),
-                            script,
-                        ]),
-
-                        // No bash fallback → run the script under PowerShell.
-                        // It will likely fail (except for some simple commands), but the error
-                        // should give a clue to the model to fix upon retry that it's running under PowerShell.
-                        None => Some(vec![
-                            ps.exe.clone(),
-                            "-NoProfile".to_string(),
-                            "-Command".to_string(),
-                            script,
-                        ]),
-                    };
-                }
-
-                // Not a bash command. If model did not generate a PowerShell command,
-                // turn it into a PowerShell command.
-                let first = command.first().map(String::as_str);
-                if first != Some(ps.exe.as_str()) {
-                    // TODO (CODEX_2900): Handle escaping newlines.
-                    if command.iter().any(|a| a.contains('\n') || a.contains('\r')) {
-                        return Some(command);
-                    }
-
-                    let joined = shlex::try_join(command.iter().map(|s| s.as_str())).ok();
-                    return joined.map(|arg| {
-                        vec![
-                            ps.exe.clone(),
-                            "-NoProfile".to_string(),
-                            "-Command".to_string(),
-                            arg,
-                        ]
-                    });
-                }
-
-                // Model generated a PowerShell command. Run it.
-                Some(command)
-            }
-            Shell::Unknown => None,
+    pub fn name(&self) -> &'static str {
+        match self.shell_type {
+            ShellType::Zsh => "zsh",
+            ShellType::Bash => "bash",
+            ShellType::PowerShell => "powershell",
+            ShellType::Sh => "sh",
+            ShellType::Cmd => "cmd",
         }
     }
 
-    pub fn name(&self) -> Option<String> {
-        match self {
-            Shell::Zsh(zsh) => std::path::Path::new(&zsh.shell_path)
-                .file_name()
-                .map(|s| s.to_string_lossy().to_string()),
-            Shell::PowerShell(ps) => Some(ps.exe.clone()),
-            Shell::Unknown => None,
-        }
-    }
-}
-
-fn strip_bash_lc(command: &Vec<String>) -> Option<String> {
-    match command.as_slice() {
-        // exactly three items
-        [first, second, third]
-            // first two must be "bash", "-lc"
-            if first == "bash" && second == "-lc" =>
-        {
-            Some(third.clone())
-        }
-        _ => None,
-    }
-}
-
-#[cfg(target_os = "macos")]
-pub async fn default_user_shell() -> Shell {
-    use tokio::process::Command;
-    use whoami;
-
-    let user = whoami::username();
-    let home = format!("/Users/{user}");
-    let output = Command::new("dscl")
-        .args([".", "-read", &home, "UserShell"])
-        .output()
-        .await
-        .ok();
-    match output {
-        Some(o) => {
-            if !o.status.success() {
-                return Shell::Unknown;
+    /// Takes a string of shell and returns the full list of command args to
+    /// use with `exec()` to run the shell command.
+    pub fn derive_exec_args(&self, command: &str, use_login_shell: bool) -> Vec<String> {
+        match self.shell_type {
+            ShellType::Zsh | ShellType::Bash | ShellType::Sh => {
+                let arg = if use_login_shell { "-lc" } else { "-c" };
+                vec![
+                    self.shell_path.to_string_lossy().to_string(),
+                    arg.to_string(),
+                    command.to_string(),
+                ]
             }
-            let stdout = String::from_utf8_lossy(&o.stdout);
-            for line in stdout.lines() {
-                if let Some(shell_path) = line.strip_prefix("UserShell: ")
-                    && shell_path.ends_with("/zsh")
-                {
-                    return Shell::Zsh(ZshShell {
-                        shell_path: shell_path.to_string(),
-                        zshrc_path: format!("{home}/.zshrc"),
-                    });
+            ShellType::PowerShell => {
+                let mut args = vec![self.shell_path.to_string_lossy().to_string()];
+                if !use_login_shell {
+                    args.push("-NoProfile".to_string());
                 }
-            }
 
-            Shell::Unknown
+                args.push("-Command".to_string());
+                args.push(command.to_string());
+                args
+            }
+            ShellType::Cmd => {
+                let mut args = vec![self.shell_path.to_string_lossy().to_string()];
+                args.push("/c".to_string());
+                args.push(command.to_string());
+                args
+            }
         }
-        _ => Shell::Unknown,
+    }
+
+    /// Return the shell snapshot if existing.
+    pub fn shell_snapshot(&self) -> Option<Arc<ShellSnapshot>> {
+        self.shell_snapshot.borrow().clone()
     }
 }
 
-#[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
-pub async fn default_user_shell() -> Shell {
-    Shell::Unknown
+pub(crate) fn empty_shell_snapshot_receiver() -> watch::Receiver<Option<Arc<ShellSnapshot>>> {
+    let (_tx, rx) = watch::channel(None);
+    rx
 }
 
-#[cfg(target_os = "windows")]
-pub async fn default_user_shell() -> Shell {
-    use tokio::process::Command;
+impl PartialEq for Shell {
+    fn eq(&self, other: &Self) -> bool {
+        self.shell_type == other.shell_type && self.shell_path == other.shell_path
+    }
+}
 
-    // Prefer PowerShell 7+ (`pwsh`) if available, otherwise fall back to Windows PowerShell.
-    let has_pwsh = Command::new("pwsh")
-        .arg("-NoLogo")
-        .arg("-NoProfile")
-        .arg("-Command")
-        .arg("$PSVersionTable.PSVersion.Major")
-        .output()
-        .await
-        .map(|o| o.status.success())
-        .unwrap_or(false);
-    let bash_exe = if Command::new("bash.exe")
-        .arg("--version")
-        .output()
-        .await
+impl Eq for Shell {}
+
+#[cfg(unix)]
+fn get_user_shell_path() -> Option<PathBuf> {
+    let uid = unsafe { libc::getuid() };
+    use std::ffi::CStr;
+    use std::mem::MaybeUninit;
+    use std::ptr;
+
+    let mut passwd = MaybeUninit::<libc::passwd>::uninit();
+
+    // We cannot use getpwuid here: it returns pointers into libc-managed
+    // storage, which is not safe to read concurrently on all targets (the musl
+    // static build used by the CLI can segfault when parallel callers race on
+    // that buffer). getpwuid_r keeps the passwd data in caller-owned memory.
+    let suggested_buffer_len = unsafe { libc::sysconf(libc::_SC_GETPW_R_SIZE_MAX) };
+    let buffer_len = usize::try_from(suggested_buffer_len)
         .ok()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
-    {
-        which::which("bash.exe").ok()
+        .filter(|len| *len > 0)
+        .unwrap_or(1024);
+    let mut buffer = vec![0; buffer_len];
+
+    loop {
+        let mut result = ptr::null_mut();
+        let status = unsafe {
+            libc::getpwuid_r(
+                uid,
+                passwd.as_mut_ptr(),
+                buffer.as_mut_ptr().cast(),
+                buffer.len(),
+                &mut result,
+            )
+        };
+
+        if status == 0 {
+            if result.is_null() {
+                return None;
+            }
+
+            let passwd = unsafe { passwd.assume_init_ref() };
+            if passwd.pw_shell.is_null() {
+                return None;
+            }
+
+            let shell_path = unsafe { CStr::from_ptr(passwd.pw_shell) }
+                .to_string_lossy()
+                .into_owned();
+            return Some(PathBuf::from(shell_path));
+        }
+
+        if status != libc::ERANGE {
+            return None;
+        }
+
+        // Retry with a larger buffer until libc can materialize the passwd entry.
+        let new_len = buffer.len().checked_mul(2)?;
+        if new_len > 1024 * 1024 {
+            return None;
+        }
+        buffer.resize(new_len, 0);
+    }
+}
+
+#[cfg(not(unix))]
+fn get_user_shell_path() -> Option<PathBuf> {
+    None
+}
+
+fn file_exists(path: &PathBuf) -> Option<PathBuf> {
+    if std::fs::metadata(path).is_ok_and(|metadata| metadata.is_file()) {
+        Some(PathBuf::from(path))
     } else {
         None
-    };
-
-    if has_pwsh {
-        Shell::PowerShell(PowerShellConfig {
-            exe: "pwsh.exe".to_string(),
-            bash_exe_fallback: bash_exe,
-        })
-    } else {
-        Shell::PowerShell(PowerShellConfig {
-            exe: "powershell.exe".to_string(),
-            bash_exe_fallback: bash_exe,
-        })
     }
 }
 
-#[cfg(test)]
-#[cfg(target_os = "macos")]
-mod tests {
-    use super::*;
-    use std::process::Command;
+fn get_shell_path(
+    shell_type: ShellType,
+    provided_path: Option<&PathBuf>,
+    binary_name: &str,
+    fallback_paths: &[&str],
+) -> Option<PathBuf> {
+    // If exact provided path exists, use it
+    if provided_path.and_then(file_exists).is_some() {
+        return provided_path.cloned();
+    }
 
-    #[tokio::test]
-    async fn test_current_shell_detects_zsh() {
-        let shell = Command::new("sh")
-            .arg("-c")
-            .arg("echo $SHELL")
-            .output()
-            .unwrap();
+    // Check if the shell we are trying to load is user's default shell
+    // if just use it
+    let default_shell_path = get_user_shell_path();
+    if let Some(default_shell_path) = default_shell_path
+        && detect_shell_type(&default_shell_path) == Some(shell_type)
+        && file_exists(&default_shell_path).is_some()
+    {
+        return Some(default_shell_path);
+    }
 
-        let home = std::env::var("HOME").unwrap();
-        let shell_path = String::from_utf8_lossy(&shell.stdout).trim().to_string();
-        if shell_path.ends_with("/zsh") {
-            assert_eq!(
-                default_user_shell().await,
-                Shell::Zsh(ZshShell {
-                    shell_path: shell_path.to_string(),
-                    zshrc_path: format!("{home}/.zshrc",),
-                })
-            );
+    if let Ok(path) = which::which(binary_name) {
+        return Some(path);
+    }
+
+    for path in fallback_paths {
+        //check exists
+        if let Some(path) = file_exists(&PathBuf::from(path)) {
+            return Some(path);
         }
     }
 
-    #[tokio::test]
-    async fn test_run_with_profile_zshrc_not_exists() {
-        let shell = Shell::Zsh(ZshShell {
-            shell_path: "/bin/zsh".to_string(),
-            zshrc_path: "/does/not/exist/.zshrc".to_string(),
+    None
+}
+
+const ZSH_FALLBACK_PATHS: &[&str] = &["/bin/zsh"];
+
+fn get_zsh_shell(path: Option<&PathBuf>) -> Option<Shell> {
+    let shell_path = get_shell_path(ShellType::Zsh, path, "zsh", ZSH_FALLBACK_PATHS);
+
+    shell_path.map(|shell_path| Shell {
+        shell_type: ShellType::Zsh,
+        shell_path,
+        shell_snapshot: empty_shell_snapshot_receiver(),
+    })
+}
+
+const BASH_FALLBACK_PATHS: &[&str] = &["/bin/bash"];
+
+fn get_bash_shell(path: Option<&PathBuf>) -> Option<Shell> {
+    let shell_path = get_shell_path(ShellType::Bash, path, "bash", BASH_FALLBACK_PATHS);
+
+    shell_path.map(|shell_path| Shell {
+        shell_type: ShellType::Bash,
+        shell_path,
+        shell_snapshot: empty_shell_snapshot_receiver(),
+    })
+}
+
+const SH_FALLBACK_PATHS: &[&str] = &["/bin/sh"];
+
+fn get_sh_shell(path: Option<&PathBuf>) -> Option<Shell> {
+    let shell_path = get_shell_path(ShellType::Sh, path, "sh", SH_FALLBACK_PATHS);
+
+    shell_path.map(|shell_path| Shell {
+        shell_type: ShellType::Sh,
+        shell_path,
+        shell_snapshot: empty_shell_snapshot_receiver(),
+    })
+}
+
+// Note the `pwsh` and `powershell` fallback paths are where the respective
+// shells are commonly installed on GitHub Actions Windows runners, but may not
+// be present on all Windows machines:
+// https://docs.github.com/en/actions/tutorials/build-and-test-code/powershell
+
+#[cfg(windows)]
+const PWSH_FALLBACK_PATHS: &[&str] = &[r#"C:\Program Files\PowerShell\7\pwsh.exe"#];
+#[cfg(not(windows))]
+const PWSH_FALLBACK_PATHS: &[&str] = &["/usr/local/bin/pwsh"];
+
+#[cfg(windows)]
+const POWERSHELL_FALLBACK_PATHS: &[&str] =
+    &[r#"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe"#];
+#[cfg(not(windows))]
+const POWERSHELL_FALLBACK_PATHS: &[&str] = &[];
+
+fn get_powershell_shell(path: Option<&PathBuf>) -> Option<Shell> {
+    let shell_path = get_shell_path(ShellType::PowerShell, path, "pwsh", PWSH_FALLBACK_PATHS)
+        .or_else(|| {
+            get_shell_path(
+                ShellType::PowerShell,
+                path,
+                "powershell",
+                POWERSHELL_FALLBACK_PATHS,
+            )
         });
-        let actual_cmd = shell.format_default_shell_invocation(vec!["myecho".to_string()]);
-        assert_eq!(actual_cmd, None);
-    }
 
-    #[tokio::test]
-    async fn test_run_with_profile_escaping_and_execution() {
-        let shell_path = "/bin/zsh";
+    shell_path.map(|shell_path| Shell {
+        shell_type: ShellType::PowerShell,
+        shell_path,
+        shell_snapshot: empty_shell_snapshot_receiver(),
+    })
+}
 
-        let cases = vec![
-            (
-                vec!["myecho"],
-                vec![shell_path, "-lc", "source ZSHRC_PATH && (myecho)"],
-                Some("It works!\n"),
-            ),
-            (
-                vec!["myecho"],
-                vec![shell_path, "-lc", "source ZSHRC_PATH && (myecho)"],
-                Some("It works!\n"),
-            ),
-            (
-                vec!["bash", "-c", "echo 'single' \"double\""],
-                vec![
-                    shell_path,
-                    "-lc",
-                    "source ZSHRC_PATH && (bash -c \"echo 'single' \\\"double\\\"\")",
-                ],
-                Some("single double\n"),
-            ),
-            (
-                vec!["bash", "-lc", "echo 'single' \"double\""],
-                vec![
-                    shell_path,
-                    "-lc",
-                    "source ZSHRC_PATH && (echo 'single' \"double\")",
-                ],
-                Some("single double\n"),
-            ),
-        ];
-        for (input, expected_cmd, expected_output) in cases {
-            use std::collections::HashMap;
-            use std::path::PathBuf;
+fn get_cmd_shell(path: Option<&PathBuf>) -> Option<Shell> {
+    let shell_path = get_shell_path(ShellType::Cmd, path, "cmd", &[]);
 
-            use crate::exec::ExecParams;
-            use crate::exec::SandboxType;
-            use crate::exec::process_exec_tool_call;
-            use crate::protocol::SandboxPolicy;
+    shell_path.map(|shell_path| Shell {
+        shell_type: ShellType::Cmd,
+        shell_path,
+        shell_snapshot: empty_shell_snapshot_receiver(),
+    })
+}
 
-            // create a temp directory with a zshrc file in it
-            let temp_home = tempfile::tempdir().unwrap();
-            let zshrc_path = temp_home.path().join(".zshrc");
-            std::fs::write(
-                &zshrc_path,
-                r#"
-                    set -x
-                    function myecho {
-                        echo 'It works!'
-                    }
-                    "#,
-            )
-            .unwrap();
-            let shell = Shell::Zsh(ZshShell {
-                shell_path: shell_path.to_string(),
-                zshrc_path: zshrc_path.to_str().unwrap().to_string(),
-            });
-
-            let actual_cmd = shell
-                .format_default_shell_invocation(input.iter().map(|s| s.to_string()).collect());
-            let expected_cmd = expected_cmd
-                .iter()
-                .map(|s| {
-                    s.replace("ZSHRC_PATH", zshrc_path.to_str().unwrap())
-                        .to_string()
-                })
-                .collect();
-
-            assert_eq!(actual_cmd, Some(expected_cmd));
-            // Actually run the command and check output/exit code
-            let output = process_exec_tool_call(
-                ExecParams {
-                    command: actual_cmd.unwrap(),
-                    cwd: PathBuf::from(temp_home.path()),
-                    timeout_ms: None,
-                    env: HashMap::from([(
-                        "HOME".to_string(),
-                        temp_home.path().to_str().unwrap().to_string(),
-                    )]),
-                    with_escalated_permissions: None,
-                    justification: None,
-                },
-                SandboxType::None,
-                &SandboxPolicy::DangerFullAccess,
-                &None,
-                None,
-            )
-            .await
-            .unwrap();
-
-            assert_eq!(output.exit_code, 0, "input: {input:?} output: {output:?}");
-            if let Some(expected) = expected_output {
-                assert_eq!(
-                    output.stdout.text, expected,
-                    "input: {input:?} output: {output:?}"
-                );
-            }
+fn ultimate_fallback_shell() -> Shell {
+    if cfg!(windows) {
+        Shell {
+            shell_type: ShellType::Cmd,
+            shell_path: PathBuf::from("cmd.exe"),
+            shell_snapshot: empty_shell_snapshot_receiver(),
+        }
+    } else {
+        Shell {
+            shell_type: ShellType::Sh,
+            shell_path: PathBuf::from("/bin/sh"),
+            shell_snapshot: empty_shell_snapshot_receiver(),
         }
     }
 }
 
+pub fn get_shell_by_model_provided_path(shell_path: &PathBuf) -> Shell {
+    detect_shell_type(shell_path)
+        .and_then(|shell_type| get_shell(shell_type, Some(shell_path)))
+        .unwrap_or(ultimate_fallback_shell())
+}
+
+pub fn get_shell(shell_type: ShellType, path: Option<&PathBuf>) -> Option<Shell> {
+    match shell_type {
+        ShellType::Zsh => get_zsh_shell(path),
+        ShellType::Bash => get_bash_shell(path),
+        ShellType::PowerShell => get_powershell_shell(path),
+        ShellType::Sh => get_sh_shell(path),
+        ShellType::Cmd => get_cmd_shell(path),
+    }
+}
+
+pub fn default_user_shell() -> Shell {
+    default_user_shell_from_path(get_user_shell_path())
+}
+
+fn default_user_shell_from_path(user_shell_path: Option<PathBuf>) -> Shell {
+    if cfg!(windows) {
+        get_shell(ShellType::PowerShell, /*path*/ None).unwrap_or(ultimate_fallback_shell())
+    } else {
+        let user_default_shell = user_shell_path
+            .and_then(|shell| detect_shell_type(&shell))
+            .and_then(|shell_type| get_shell(shell_type, /*path*/ None));
+
+        let shell_with_fallback = if cfg!(target_os = "macos") {
+            user_default_shell
+                .or_else(|| get_shell(ShellType::Zsh, /*path*/ None))
+                .or_else(|| get_shell(ShellType::Bash, /*path*/ None))
+        } else {
+            user_default_shell
+                .or_else(|| get_shell(ShellType::Bash, /*path*/ None))
+                .or_else(|| get_shell(ShellType::Zsh, /*path*/ None))
+        };
+
+        shell_with_fallback.unwrap_or(ultimate_fallback_shell())
+    }
+}
+
 #[cfg(test)]
-#[cfg(target_os = "windows")]
-mod tests_windows {
+mod detect_shell_type_tests {
     use super::*;
 
     #[test]
-    fn test_format_default_shell_invocation_powershell() {
-        let cases = vec![
-            (
-                Shell::PowerShell(PowerShellConfig {
-                    exe: "pwsh.exe".to_string(),
-                    bash_exe_fallback: None,
-                }),
-                vec!["bash", "-lc", "echo hello"],
-                vec!["pwsh.exe", "-NoProfile", "-Command", "echo hello"],
-            ),
-            (
-                Shell::PowerShell(PowerShellConfig {
-                    exe: "powershell.exe".to_string(),
-                    bash_exe_fallback: None,
-                }),
-                vec!["bash", "-lc", "echo hello"],
-                vec!["powershell.exe", "-NoProfile", "-Command", "echo hello"],
-            ),
-            (
-                Shell::PowerShell(PowerShellConfig {
-                    exe: "pwsh.exe".to_string(),
-                    bash_exe_fallback: Some(PathBuf::from("bash.exe")),
-                }),
-                vec!["bash", "-lc", "echo hello"],
-                vec!["bash.exe", "-lc", "echo hello"],
-            ),
-            (
-                Shell::PowerShell(PowerShellConfig {
-                    exe: "pwsh.exe".to_string(),
-                    bash_exe_fallback: Some(PathBuf::from("bash.exe")),
-                }),
-                vec![
-                    "bash",
-                    "-lc",
-                    "apply_patch <<'EOF'\n*** Begin Patch\n*** Update File: destination_file.txt\n-original content\n+modified content\n*** End Patch\nEOF",
-                ],
-                vec![
-                    "bash.exe",
-                    "-lc",
-                    "apply_patch <<'EOF'\n*** Begin Patch\n*** Update File: destination_file.txt\n-original content\n+modified content\n*** End Patch\nEOF",
-                ],
-            ),
-            (
-                Shell::PowerShell(PowerShellConfig {
-                    exe: "pwsh.exe".to_string(),
-                    bash_exe_fallback: Some(PathBuf::from("bash.exe")),
-                }),
-                vec!["echo", "hello"],
-                vec!["pwsh.exe", "-NoProfile", "-Command", "echo hello"],
-            ),
-            (
-                Shell::PowerShell(PowerShellConfig {
-                    exe: "pwsh.exe".to_string(),
-                    bash_exe_fallback: Some(PathBuf::from("bash.exe")),
-                }),
-                vec!["pwsh.exe", "-NoProfile", "-Command", "echo hello"],
-                vec!["pwsh.exe", "-NoProfile", "-Command", "echo hello"],
-            ),
-            (
-                // TODO (CODEX_2900): Handle escaping newlines for powershell invocation.
-                Shell::PowerShell(PowerShellConfig {
-                    exe: "powershell.exe".to_string(),
-                    bash_exe_fallback: Some(PathBuf::from("bash.exe")),
-                }),
-                vec![
-                    "codex-mcp-server.exe",
-                    "--codex-run-as-apply-patch",
-                    "*** Begin Patch\n*** Update File: C:\\Users\\person\\destination_file.txt\n-original content\n+modified content\n*** End Patch",
-                ],
-                vec![
-                    "codex-mcp-server.exe",
-                    "--codex-run-as-apply-patch",
-                    "*** Begin Patch\n*** Update File: C:\\Users\\person\\destination_file.txt\n-original content\n+modified content\n*** End Patch",
-                ],
-            ),
-        ];
-
-        for (shell, input, expected_cmd) in cases {
-            let actual_cmd = shell
-                .format_default_shell_invocation(input.iter().map(|s| s.to_string()).collect());
-            assert_eq!(
-                actual_cmd,
-                Some(expected_cmd.iter().map(|s| s.to_string()).collect())
-            );
-        }
+    fn test_detect_shell_type() {
+        assert_eq!(
+            detect_shell_type(&PathBuf::from("zsh")),
+            Some(ShellType::Zsh)
+        );
+        assert_eq!(
+            detect_shell_type(&PathBuf::from("bash")),
+            Some(ShellType::Bash)
+        );
+        assert_eq!(
+            detect_shell_type(&PathBuf::from("pwsh")),
+            Some(ShellType::PowerShell)
+        );
+        assert_eq!(
+            detect_shell_type(&PathBuf::from("powershell")),
+            Some(ShellType::PowerShell)
+        );
+        assert_eq!(detect_shell_type(&PathBuf::from("fish")), None);
+        assert_eq!(detect_shell_type(&PathBuf::from("other")), None);
+        assert_eq!(
+            detect_shell_type(&PathBuf::from("/bin/zsh")),
+            Some(ShellType::Zsh)
+        );
+        assert_eq!(
+            detect_shell_type(&PathBuf::from("/bin/bash")),
+            Some(ShellType::Bash)
+        );
+        assert_eq!(
+            detect_shell_type(&PathBuf::from("powershell.exe")),
+            Some(ShellType::PowerShell)
+        );
+        assert_eq!(
+            detect_shell_type(&PathBuf::from(if cfg!(windows) {
+                "C:\\windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe"
+            } else {
+                "/usr/local/bin/pwsh"
+            })),
+            Some(ShellType::PowerShell)
+        );
+        assert_eq!(
+            detect_shell_type(&PathBuf::from("pwsh.exe")),
+            Some(ShellType::PowerShell)
+        );
+        assert_eq!(
+            detect_shell_type(&PathBuf::from("/usr/local/bin/pwsh")),
+            Some(ShellType::PowerShell)
+        );
+        assert_eq!(
+            detect_shell_type(&PathBuf::from("/bin/sh")),
+            Some(ShellType::Sh)
+        );
+        assert_eq!(detect_shell_type(&PathBuf::from("sh")), Some(ShellType::Sh));
+        assert_eq!(
+            detect_shell_type(&PathBuf::from("cmd")),
+            Some(ShellType::Cmd)
+        );
+        assert_eq!(
+            detect_shell_type(&PathBuf::from("cmd.exe")),
+            Some(ShellType::Cmd)
+        );
     }
 }
+
+#[cfg(test)]
+#[cfg(unix)]
+#[path = "shell_tests.rs"]
+mod tests;

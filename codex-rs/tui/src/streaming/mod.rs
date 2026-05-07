@@ -1,74 +1,123 @@
-use crate::markdown_stream::AnimatedLineStreamer;
+//! Streaming primitives used by the TUI transcript pipeline.
+//!
+//! `StreamState` owns newline-gated markdown collection and a FIFO queue of committed render lines.
+//! Higher-level modules build on top of this state:
+//! - `controller` adapts queued lines into `HistoryCell` emission rules for message and plan streams.
+//! - `chunking` computes adaptive drain plans from queue pressure.
+//! - `commit_tick` binds policy decisions to concrete controller drains.
+//!
+//! The key invariant is queue ordering. All drains pop from the front, and enqueue records an
+//! arrival timestamp so policy code can reason about oldest queued age without peeking into text.
+
+use std::collections::VecDeque;
+use std::path::Path;
+use std::time::Duration;
+use std::time::Instant;
+
+use ratatui::text::Line;
+
 use crate::markdown_stream::MarkdownStreamCollector;
+pub(crate) mod chunking;
+pub(crate) mod commit_tick;
 pub(crate) mod controller;
 
+struct QueuedLine {
+    line: Line<'static>,
+    enqueued_at: Instant,
+}
+
+/// Holds in-flight markdown stream state and queued committed lines.
 pub(crate) struct StreamState {
     pub(crate) collector: MarkdownStreamCollector,
-    pub(crate) streamer: AnimatedLineStreamer,
+    queued_lines: VecDeque<QueuedLine>,
     pub(crate) has_seen_delta: bool,
 }
 
 impl StreamState {
-    pub(crate) fn new() -> Self {
+    /// Create stream state whose markdown collector renders local file links relative to `cwd`.
+    ///
+    /// Controllers are expected to pass the session cwd here once and keep it stable for the
+    /// lifetime of the active stream.
+    pub(crate) fn new(width: Option<usize>, cwd: &Path) -> Self {
         Self {
-            collector: MarkdownStreamCollector::new(),
-            streamer: AnimatedLineStreamer::new(),
+            collector: MarkdownStreamCollector::new(width, cwd),
+            queued_lines: VecDeque::new(),
             has_seen_delta: false,
         }
     }
+    /// Resets collector and queue state for the next stream lifecycle.
     pub(crate) fn clear(&mut self) {
         self.collector.clear();
-        self.streamer.clear();
+        self.queued_lines.clear();
         self.has_seen_delta = false;
     }
-    pub(crate) fn step(&mut self) -> crate::markdown_stream::StepResult {
-        self.streamer.step()
+    /// Drains one queued line from the front of the queue.
+    pub(crate) fn step(&mut self) -> Vec<Line<'static>> {
+        self.queued_lines
+            .pop_front()
+            .map(|queued| queued.line)
+            .into_iter()
+            .collect()
     }
-    pub(crate) fn drain_all(&mut self) -> crate::markdown_stream::StepResult {
-        self.streamer.drain_all()
+    /// Drains up to `max_lines` queued lines from the front of the queue.
+    ///
+    /// Callers that pass very large values still get bounded behavior because this method clamps to
+    /// the currently available queue length.
+    pub(crate) fn drain_n(&mut self, max_lines: usize) -> Vec<Line<'static>> {
+        let end = max_lines.min(self.queued_lines.len());
+        self.queued_lines
+            .drain(..end)
+            .map(|queued| queued.line)
+            .collect()
     }
+    /// Clears queued lines while keeping collector/turn lifecycle state intact.
+    pub(crate) fn clear_queue(&mut self) {
+        self.queued_lines.clear();
+    }
+    /// Returns whether no lines are queued for commit.
     pub(crate) fn is_idle(&self) -> bool {
-        self.streamer.is_idle()
+        self.queued_lines.is_empty()
     }
-    pub(crate) fn enqueue(&mut self, lines: Vec<ratatui::text::Line<'static>>) {
-        self.streamer.enqueue(lines)
+    /// Returns the current queue depth.
+    pub(crate) fn queued_len(&self) -> usize {
+        self.queued_lines.len()
+    }
+    /// Returns the age of the oldest queued line.
+    pub(crate) fn oldest_queued_age(&self, now: Instant) -> Option<Duration> {
+        self.queued_lines
+            .front()
+            .map(|queued| now.saturating_duration_since(queued.enqueued_at))
+    }
+    /// Appends committed lines to the queue with a shared enqueue timestamp.
+    pub(crate) fn enqueue(&mut self, lines: Vec<Line<'static>>) {
+        let now = Instant::now();
+        self.queued_lines
+            .extend(lines.into_iter().map(|line| QueuedLine {
+                line,
+                enqueued_at: now,
+            }));
     }
 }
 
-pub(crate) struct HeaderEmitter {
-    emitted_this_turn: bool,
-    emitted_in_stream: bool,
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pretty_assertions::assert_eq;
+    use std::path::PathBuf;
 
-impl HeaderEmitter {
-    pub(crate) fn new() -> Self {
-        Self {
-            emitted_this_turn: false,
-            emitted_in_stream: false,
-        }
+    fn test_cwd() -> PathBuf {
+        // These tests only need a stable absolute cwd; using temp_dir() avoids baking Unix- or
+        // Windows-specific root semantics into the fixtures.
+        std::env::temp_dir()
     }
 
-    pub(crate) fn reset_for_new_turn(&mut self) {
-        self.emitted_this_turn = false;
-        self.emitted_in_stream = false;
-    }
+    #[test]
+    fn drain_n_clamps_to_available_lines() {
+        let mut state = StreamState::new(/*width*/ None, &test_cwd());
+        state.enqueue(vec![Line::from("one")]);
 
-    pub(crate) fn reset_for_stream(&mut self) {
-        self.emitted_in_stream = false;
-    }
-
-    /// Allow emitting the header again within the current turn after a finalize.
-    pub(crate) fn allow_reemit_in_turn(&mut self) {
-        self.emitted_this_turn = false;
-    }
-
-    pub(crate) fn maybe_emit_header(&mut self) -> bool {
-        if !self.emitted_in_stream && !self.emitted_this_turn {
-            self.emitted_in_stream = true;
-            self.emitted_this_turn = true;
-            true
-        } else {
-            false
-        }
+        let drained = state.drain_n(/*max_lines*/ 8);
+        assert_eq!(drained, vec![Line::from("one")]);
+        assert!(state.is_idle());
     }
 }
